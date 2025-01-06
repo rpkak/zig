@@ -97,9 +97,19 @@ pub fn format(
     }
 
     @setEvalBranchQuota(2000000);
-    comptime var arg_state: ArgState = .{ .args_len = fields_info.len };
+
     comptime var i = 0;
-    inline while (i < fmt.len) {
+
+    // literals is a string that contains all literals of fmt one after another
+    comptime var literals: []const u8 = &.{};
+    comptime var literal_begin = 0;
+
+    const Element = union(enum) {
+        literal: struct { begin: usize, end: usize },
+        placeholder: struct { begin: usize, end: usize },
+    };
+    comptime var elements: []const Element = &.{};
+    inline while (true) {
         const start_index = i;
 
         inline while (i < fmt.len) : (i += 1) {
@@ -121,13 +131,21 @@ pub fn format(
             i += 2;
         }
 
-        // Write out the literal
-        if (start_index != end_index) {
-            try writer.writeAll(fmt[start_index..end_index]);
-        }
+        // Add literal to literals
+        literals = literals ++ fmt[start_index..end_index];
 
         // We've already skipped the other brace, restart the loop
         if (unescape_brace) continue;
+
+        // Add literal to elements
+        if (literal_begin != literals.len) {
+            elements = elements ++ &[1]Element{
+                .{
+                    .literal = .{ .begin = literal_begin, .end = literals.len },
+                },
+            };
+            literal_begin = literals.len;
+        }
 
         if (i >= fmt.len) break;
 
@@ -152,51 +170,68 @@ pub fn format(
         comptime assert(fmt[i] == '}');
         i += 1;
 
-        const placeholder = comptime Placeholder.parse(fmt[fmt_begin..fmt_end].*);
-        const arg_pos = comptime switch (placeholder.arg) {
-            .none => null,
-            .number => |pos| pos,
-            .named => |arg_name| meta.fieldIndex(ArgsType, arg_name) orelse
-                @compileError("no argument with name '" ++ arg_name ++ "'"),
-        };
-
-        const width = switch (placeholder.width) {
-            .none => null,
-            .number => |v| v,
-            .named => |arg_name| blk: {
-                const arg_i = comptime meta.fieldIndex(ArgsType, arg_name) orelse
-                    @compileError("no argument with name '" ++ arg_name ++ "'");
-                _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
-                break :blk @field(args, arg_name);
+        // Add placeholder to elements
+        elements = elements ++ &[1]Element{
+            .{
+                .placeholder = .{ .begin = fmt_begin, .end = fmt_end },
             },
         };
+    }
 
-        const precision = switch (placeholder.precision) {
-            .none => null,
-            .number => |v| v,
-            .named => |arg_name| blk: {
-                const arg_i = comptime meta.fieldIndex(ArgsType, arg_name) orelse
-                    @compileError("no argument with name '" ++ arg_name ++ "'");
-                _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
-                break :blk @field(args, arg_name);
+    comptime var arg_state: ArgState = .{ .args_len = fields_info.len };
+    inline for (elements) |element| {
+        switch (element) {
+            .literal => |literal| {
+                try writer.writeAll(literals[literal.begin..literal.end]);
             },
-        };
+            .placeholder => |ph| {
+                const placeholder = comptime Placeholder.parse(fmt[ph.begin..ph.end].*);
+                const arg_pos = comptime switch (placeholder.arg) {
+                    .none => null,
+                    .number => |pos| pos,
+                    .named => |arg_name| meta.fieldIndex(ArgsType, arg_name) orelse
+                        @compileError("no argument with name '" ++ arg_name ++ "'"),
+                };
 
-        const arg_to_print = comptime arg_state.nextArg(arg_pos) orelse
-            @compileError("too few arguments");
+                const width = switch (placeholder.width) {
+                    .none => null,
+                    .number => |v| v,
+                    .named => |arg_name| blk: {
+                        const arg_i = comptime meta.fieldIndex(ArgsType, arg_name) orelse
+                            @compileError("no argument with name '" ++ arg_name ++ "'");
+                        _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
+                        break :blk @field(args, arg_name);
+                    },
+                };
 
-        try formatType(
-            @field(args, fields_info[arg_to_print].name),
-            placeholder.specifier_arg,
-            FormatOptions{
-                .fill = placeholder.fill,
-                .alignment = placeholder.alignment,
-                .width = width,
-                .precision = precision,
+                const precision = switch (placeholder.precision) {
+                    .none => null,
+                    .number => |v| v,
+                    .named => |arg_name| blk: {
+                        const arg_i = comptime meta.fieldIndex(ArgsType, arg_name) orelse
+                            @compileError("no argument with name '" ++ arg_name ++ "'");
+                        _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
+                        break :blk @field(args, arg_name);
+                    },
+                };
+
+                const arg_to_print = comptime arg_state.nextArg(arg_pos) orelse
+                    @compileError("too few arguments");
+
+                try formatType(
+                    @field(args, fields_info[arg_to_print].name),
+                    placeholder.specifier_arg,
+                    FormatOptions{
+                        .fill = placeholder.fill,
+                        .alignment = placeholder.alignment,
+                        .width = width,
+                        .precision = precision,
+                    },
+                    writer,
+                    std.options.fmt_max_depth,
+                );
             },
-            writer,
-            std.options.fmt_max_depth,
-        );
+        }
     }
 
     if (comptime arg_state.hasUnusedArgs()) {
