@@ -2891,3 +2891,114 @@ test "writableSlice with fixed writer" {
     try w.writeByte(1);
     try std.testing.expectError(error.WriteFailed, w.writableSlice(2));
 }
+
+pub fn vprintf(w: *Writer, format: [*:0]const u8, vlist: std.builtin.VaList) (Error || error{Overflow})!void {
+    _ = vlist;
+    var ctx: struct {
+        start_index: usize = 0,
+        i: usize = 0,
+
+        use_argument_numbers: ?bool = null,
+
+        fn writeFormatString(ctx: *const @This()) !void {
+            return w.writeAll(format[ctx.start_index..ctx.i]);
+        }
+
+        fn parseInt(ctx: *@This()) !c_int {
+            // TODO: What in which cases is this even true
+            assert(format[ctx.i] >= '1' and format[ctx.i] <= '9');
+            var int = format[ctx.i] - '0';
+            ctx.i += 1;
+            while (format[ctx.i] >= '0' and format[ctx.i] <= '9') : (ctx.i += 1) {
+                int = try std.math.add(c_int, try std.math.mul(c_int, int, 10), format[ctx.i] - '0');
+            }
+            return int;
+        }
+    } = .{};
+
+    while (true) : (ctx.i += 1) {
+        switch (format[ctx.i]) {
+            0 => return ctx.writeFormatString(),
+            '%' => {
+                ctx.writeFormatString();
+                ctx.i += 1;
+                switch (format[ctx.i]) {
+                    '%' => {},
+                    else => {
+                        var argument: ?c_int = null;
+                        var alternate_form: bool = false;
+                        var padding: enum { left_space, left_zero, right_space } = .left_space;
+                        var pos_sign: enum { no, plus, space } = .no;
+                        var min_width: c_int = 0;
+
+                        skip_flags: {
+                            // argument or width
+                            {
+                                defer if (ctx.use_argument_numbers) |use_arg_nums| {
+                                    assert(use_arg_nums == (argument != null));
+                                } else {
+                                    ctx.use_argument_numbers = argument != null;
+                                };
+
+                                if (format[ctx.i] >= '1' and format[ctx.i] <= '9') {
+                                    const int = ctx.parseInt();
+                                    if (format[ctx.i] == '$') {
+                                        argument = int;
+                                        ctx.i += 1;
+                                    } else {
+                                        min_width = int;
+                                        break :skip_flags;
+                                    }
+                                }
+                            }
+
+                            // flags
+                            while (true) : (ctx.i += 1) {
+                                switch (format[ctx.i]) {
+                                    '-' => padding = .right_space,
+                                    '0' => if (padding == .left_space) {
+                                        padding = .left_zero;
+                                    },
+                                    '+' => pos_sign = .plus,
+                                    ' ' => if (pos_sign == .no) {
+                                        pos_sign = .space;
+                                    },
+                                    '#' => alternate_form = true,
+                                    // TODO: '\'' flag
+                                    else => break,
+                                }
+                            }
+
+                            // width
+                            if (format[i] >= '1' and format[i] <= '9') {
+                                min_width = format[i] - '0';
+                                i += 1;
+                                while (format[i] >= '1' and format[i] <= '9') : (i += 1) {
+                                    min_width = try std.math.add(c_int, try std.math.mul(c_int, min_width, 10), format[i] - '0');
+                                }
+                            } else if (format[i] == '*') {
+                                i += 1;
+                                if (use_argument_numbers.?) {
+                                    assert(format[i] >= '1' and format[i] <= '9');
+                                    var min_width_argument = format[i] - '0';
+                                    i += 1;
+                                    while (format[i] >= '1' and format[i] <= '9') : (i += 1) {
+                                        min_width_argument = try std.math.add(c_int, try std.math.mul(c_int, min_width_argument, 10), format[i] - '0');
+                                    }
+                                    assert(format[i] == '$');
+                                    i += 1;
+                                    // TODO: set min_width to
+                                } else {
+                                    // TODO: set min_width to next arg
+                                }
+                            }
+                        }
+                    },
+                }
+                start_index = i;
+            },
+            else => {},
+        }
+    }
+    unreachable;
+}
