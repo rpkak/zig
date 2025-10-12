@@ -635,13 +635,13 @@ pub fn print(w: *Writer, comptime fmt: []const u8, args: anytype) Error!void {
         // We've already skipped the other brace, restart the loop
         if (unescape_brace) continue;
 
-        // Write out the literal
-        if (literal.len != 0) {
-            try w.writeAll(literal);
-            literal = "";
+        if (i == fmt.len) {
+            if (literal.len != 0) {
+                try w.writeAll(literal);
+            }
+            break;
         }
-
-        if (i >= fmt.len) break;
+        comptime assert(i < fmt.len);
 
         if (fmt[i] == '}') {
             @compileError("missing opening {");
@@ -673,12 +673,15 @@ pub fn print(w: *Writer, comptime fmt: []const u8, args: anytype) Error!void {
                 @compileError("no argument with name '" ++ arg_name ++ "'"),
         };
 
+        comptime var comptime_print = true;
+
         const width = switch (placeholder.width) {
             .none => null,
             .number => |v| v,
             .named => |arg_name| blk: {
                 const arg_i = comptime std.meta.fieldIndex(ArgsType, arg_name) orelse
                     @compileError("no argument with name '" ++ arg_name ++ "'");
+                comptime_print = comptime_print and fields_info[arg_i].is_comptime;
                 _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
                 break :blk @field(args, arg_name);
             },
@@ -690,6 +693,7 @@ pub fn print(w: *Writer, comptime fmt: []const u8, args: anytype) Error!void {
             .named => |arg_name| blk: {
                 const arg_i = comptime std.meta.fieldIndex(ArgsType, arg_name) orelse
                     @compileError("no argument with name '" ++ arg_name ++ "'");
+                comptime_print = comptime_print and fields_info[arg_i].is_comptime;
                 _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
                 break :blk @field(args, arg_name);
             },
@@ -698,17 +702,70 @@ pub fn print(w: *Writer, comptime fmt: []const u8, args: anytype) Error!void {
         const arg_to_print = comptime arg_state.nextArg(arg_pos) orelse
             @compileError("too few arguments");
 
-        try w.printValue(
-            placeholder.specifier_arg,
-            .{
-                .fill = placeholder.fill,
-                .alignment = placeholder.alignment,
-                .width = width,
-                .precision = precision,
-            },
-            @field(args, fields_info[arg_to_print].name),
-            std.options.fmt_max_depth,
-        );
+        comptime_print = comptime_print and fields_info[arg_to_print].is_comptime;
+
+        // comptime_print = false;
+        // @compileLog(comptime_print);
+        // comptime_print = false;
+        if (comptime_print) comptime {
+            // var comptime_writer: Writer = .{
+            //     .buffer = literal,
+            //     .end = literal.len,
+            //     .vtable = &VTable{
+            //         .drain = drain,
+            //     },
+            // };
+
+            // std.fmt.comptimePrint(comptime fmt: []const u8, args: anytype)
+            var trash_buffer: [64]u8 = undefined;
+            var wd: Discarding = .init(&trash_buffer);
+            wd.writer.printValue(
+                placeholder.specifier_arg,
+                .{
+                    .fill = placeholder.fill,
+                    .alignment = placeholder.alignment,
+                    .width = width,
+                    .precision = precision,
+                },
+                @field(args, fields_info[arg_to_print].name),
+                std.options.fmt_max_depth,
+            ) catch unreachable;
+
+            var buf: [wd.count + wd.writer.end]u8 = undefined;
+            var wf: Writer = .fixed(&buf);
+            wf.printValue(
+                placeholder.specifier_arg,
+                .{
+                    .fill = placeholder.fill,
+                    .alignment = placeholder.alignment,
+                    .width = width,
+                    .precision = precision,
+                },
+                @field(args, fields_info[arg_to_print].name),
+                std.options.fmt_max_depth,
+            ) catch unreachable;
+            const content = wf.buffered();
+            assert(content.len == wd.count + wd.writer.end);
+            literal = literal ++ wf.buffered();
+        } else {
+            // Write out the literal
+            if (literal.len != 0) {
+                try w.writeAll(literal);
+                literal = "";
+            }
+
+            try w.printValue(
+                placeholder.specifier_arg,
+                .{
+                    .fill = placeholder.fill,
+                    .alignment = placeholder.alignment,
+                    .width = width,
+                    .precision = precision,
+                },
+                @field(args, fields_info[arg_to_print].name),
+                std.options.fmt_max_depth,
+            );
+        }
     }
 
     if (comptime arg_state.hasUnusedArgs()) {
@@ -1746,12 +1803,12 @@ pub fn printByteSize(
         .binary => mags_iec[magnitude],
     };
 
-    const s = switch (magnitude) {
-        0 => buf[0..std.fmt.printInt(&buf, value, 10, .lower, .{})],
-        else => std.fmt.float.render(&buf, new_value, .{ .mode = .decimal, .precision = options.precision }) catch |err| switch (err) {
+    const s = if (magnitude == 0)
+        buf[0..std.fmt.printInt(&buf, value, 10, .lower, .{})]
+    else
+        std.fmt.float.render(&buf, new_value, .{ .mode = .decimal, .precision = options.precision }) catch |err| switch (err) {
             error.BufferTooSmall => unreachable,
-        },
-    };
+        };
 
     var i: usize = s.len;
     if (suffix == ' ') {
@@ -2825,6 +2882,52 @@ pub const Allocating = struct {
         try testAllocating(.fromByteUnits(64));
     }
 };
+
+// pub const Comptime = struct {
+//     writer: Writer,
+//
+//     pub fn init(buffer: []u8) Comptime {
+//         return .{
+//             .writer = .{
+//                 .buffer = buffer,
+//                 .vtable = &VTable{
+//                     .drain = Comptime.drain,
+//                     .flush = noopFlush,
+//                     .rebase = Comptime.rebase,
+//                 },
+//             },
+//         };
+//     }
+//
+//     fn drain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
+//         comptime var new_buf = w.buffer[0..w.end];
+//         for (data[0 .. data.len - 1]) |bytes| {
+//             new_buf = new_buf ++ bytes;
+//         }
+//         for (0..splat) |_| {
+//             new_buf = new_buf ++ data[data.len - 1];
+//         }
+//         w.buffer = new_buf;
+//         w.end = new_buf.len;
+//     }
+//
+//     fn rebase(w: *Writer, preserve: usize, capacity: usize) Error!void {
+//         const min_len = @max(preserve, w.end) + capacity;
+//         w.buffer = w.buffer ++ @as([min_len -| w.buffer.len]u8, undefined);
+//     }
+// };
+//
+// test Comptime {
+//     comptime {
+//         var c: Comptime = .init(&.{});
+//
+//         const x: i32 = 42;
+//         const y: i32 = 1234;
+//         try c.writer.print("x: {}\ny: {}\n", .{ x, y });
+//         const expected = "x: 42\ny: 1234\n";
+//         try testing.expectEqual(expected, c.writer.buffered());
+//     }
+// }
 
 test "discarding sendFile" {
     var tmp_dir = testing.tmpDir(.{});
